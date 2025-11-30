@@ -1,18 +1,24 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { 
   AppState, 
-  TestConfig, 
   TestInstance, 
   SessionResult,
   Complexity,
-  KeypointResult
 } from './types';
 import { NORMATIVE_PROFILES, DEFAULT_TOPICS } from './constants';
-import { generateTestContent } from './services/geminiService';
+import { generateTestContent, refineTranscription, generateClinicalAnalysis } from './services/geminiService';
 import { scoreSession, getKeypointTokens } from './services/scoringService';
 import { saveSession, getSessions, getLatestSession } from './services/storageService';
 import { Button } from './components/Button';
 import { HistoryChart } from './components/HistoryChart';
+
+// Ambient declaration for Web Speech API
+declare global {
+  interface Window {
+    webkitSpeechRecognition: any;
+    SpeechRecognition: any;
+  }
+}
 
 const App: React.FC = () => {
   // Global State
@@ -30,36 +36,39 @@ const App: React.FC = () => {
   });
 
   // Setup State
-  // Default to High Performance profile
   const [profileId, setProfileId] = useState('adult_high_performance');
   const [duration, setDuration] = useState(90); // seconds
   const [useCalibrated, setUseCalibrated] = useState(false);
   const [userWpm, setUserWpm] = useState(250);
 
-  // Internal generation state (not exposed to user setup)
+  // Internal generation state
   const [generatedConfig, setGeneratedConfig] = useState<{topic: string, complexity: Complexity} | null>(null);
 
   // Test State
   const [testData, setTestData] = useState<TestInstance | null>(null);
   const [timeLeft, setTimeLeft] = useState(0);
   const [elapsedTime, setElapsedTime] = useState(0);
-  const [isFinishedEarly, setIsFinishedEarly] = useState(false);
 
   // Recall State
   const [recallText, setRecallText] = useState('');
+  const [isRecording, setIsRecording] = useState(false);
+  const [isProcessingAudio, setIsProcessingAudio] = useState(false);
+  const [liveTranscript, setLiveTranscript] = useState(''); // Text shown during recording overlay
+  const recognitionRef = useRef<any>(null);
+  const accumulatedTranscriptRef = useRef<string>(''); // Raw buffer to avoid React state closure issues
 
   // Result State
   const [result, setResult] = useState<SessionResult | null>(null);
   const [history, setHistory] = useState<SessionResult[]>([]);
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
 
   // Refs for timer
-  const timerRef = useRef<number | null>(null);
   const startTimeRef = useRef<number>(0);
 
   // Load History on Mount
   useEffect(() => {
     setHistory(getSessions());
-  }, [appState]); // Reload when state changes (e.g. back to home)
+  }, [appState]);
 
   // Theme Effect
   useEffect(() => {
@@ -74,7 +83,7 @@ const App: React.FC = () => {
 
   const toggleTheme = () => setIsDarkMode(!isDarkMode);
 
-  // --- Handlers ---
+  // --- Logic Handlers ---
 
   const handleStartGeneration = async () => {
     setAppState(AppState.GENERATING);
@@ -83,7 +92,6 @@ const App: React.FC = () => {
     try {
       const selectedProfile = NORMATIVE_PROFILES.find(p => p.id === profileId)!;
       
-      // Randomize Topic and Complexity
       const randomTopic = DEFAULT_TOPICS[Math.floor(Math.random() * DEFAULT_TOPICS.length)];
       const randomComplexity: Complexity = Math.random() > 0.5 ? 'neutral' : 'dense';
       
@@ -91,13 +99,8 @@ const App: React.FC = () => {
 
       const baseWpm = useCalibrated ? userWpm : selectedProfile.mean_wpm;
       
-      // ADJUSTMENT: If text is dense, we reduce the effective WPM used for target word calculation.
-      // Dense texts take longer to process cognitively. 
-      // Reducing target WPM by 15% ensures the generated text is slightly shorter, 
-      // making the fixed time limit fair for the increased difficulty.
       const adjustedWpm = randomComplexity === 'dense' ? Math.round(baseWpm * 0.85) : baseWpm;
 
-      // Calculate target words: (Time / 60) * Adjusted WPM
       const targetWords = Math.round((duration / 60) * adjustedWpm);
       
       const { passage, keypoints } = await generateTestContent(
@@ -107,7 +110,6 @@ const App: React.FC = () => {
         targetWords
       );
 
-      // Create Test Instance
       const newTest: TestInstance = {
         id: crypto.randomUUID(),
         language: selectedProfile.language,
@@ -136,68 +138,167 @@ const App: React.FC = () => {
     }
   };
 
-  const handleStartReading = () => {
-    startTimeRef.current = Date.now();
-    setElapsedTime(0);
-    setIsFinishedEarly(false);
-    
-    timerRef.current = window.setInterval(() => {
-      const now = Date.now();
-      const passed = Math.floor((now - startTimeRef.current) / 1000);
-      setElapsedTime(passed);
-      
-      setTimeLeft((prev) => {
-        if (prev <= 1) {
-          handleFinishReading(true);
-          return 0;
-        }
-        return prev - 1;
-      });
-    }, 1000);
-  };
-
-  useEffect(() => {
-    if (appState === AppState.READING) {
-      handleStartReading();
-    }
-    return () => {
-      if (timerRef.current) {
-        window.clearInterval(timerRef.current);
-        timerRef.current = null;
-      }
-    };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [appState]);
-
   const handleFinishReading = (timeExpired: boolean) => {
-    if (timerRef.current) {
-      window.clearInterval(timerRef.current);
-      timerRef.current = null;
-    }
-    
-    const finalElapsed = Math.floor((Date.now() - startTimeRef.current) / 1000);
-    setElapsedTime(timeExpired ? duration : finalElapsed);
-    setIsFinishedEarly(!timeExpired);
-    
+    const finalElapsed = timeExpired 
+      ? duration 
+      : Math.floor((Date.now() - startTimeRef.current) / 1000);
+      
+    setElapsedTime(finalElapsed);
     setAppState(AppState.RECALL);
   };
 
-  const handleSubmitRecall = () => {
+  // Robust Timer Effect using Date.now() to prevent drift and ensure auto-advance
+  useEffect(() => {
+    let intervalId: number;
+
+    if (appState === AppState.READING) {
+      startTimeRef.current = Date.now();
+      setTimeLeft(duration);
+      setElapsedTime(0);
+
+      intervalId = window.setInterval(() => {
+        const now = Date.now();
+        const passed = Math.floor((now - startTimeRef.current) / 1000);
+        const remaining = Math.max(0, duration - passed);
+
+        setElapsedTime(passed);
+        setTimeLeft(remaining);
+
+        if (remaining === 0) {
+          window.clearInterval(intervalId);
+          handleFinishReading(true);
+        }
+      }, 200); // Check more frequently for UI smoothness and quick transition
+    }
+
+    return () => {
+      if (intervalId) window.clearInterval(intervalId);
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [appState, duration]); 
+
+
+  // Speech Recognition Logic
+  const startRecording = () => {
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRecognition) {
+      alert("Seu navegador não suporta reconhecimento de fala.");
+      return;
+    }
+
+    const recognition = new SpeechRecognition();
+    recognition.lang = testData?.language || 'pt-BR';
+    recognition.continuous = true;
+    recognition.interimResults = true;
+
+    accumulatedTranscriptRef.current = '';
+    setLiveTranscript('');
+    setIsRecording(true);
+
+    recognition.onresult = (event: any) => {
+      let interim = '';
+      let newFinal = '';
+
+      for (let i = event.resultIndex; i < event.results.length; ++i) {
+        if (event.results[i].isFinal) {
+          newFinal += event.results[i][0].transcript;
+        } else {
+          interim += event.results[i][0].transcript;
+        }
+      }
+      
+      if (newFinal) {
+        accumulatedTranscriptRef.current += ' ' + newFinal;
+      }
+
+      setLiveTranscript(accumulatedTranscriptRef.current + ' ' + interim);
+    };
+
+    recognition.onerror = (event: any) => {
+      console.error("Speech error", event.error);
+      stopRecording();
+    };
+    
+    // Prevent auto-stop on silence in some browsers if we want continuous
+    // But for this UX, if it stops, we just process.
+    recognition.onend = () => {
+       if (isRecording) {
+         // If it stopped but we didn't explicitly trigger stopRecording (e.g. silence),
+         // we treat it as finishing the session.
+         stopRecording();
+       }
+    };
+
+    recognitionRef.current = recognition;
+    recognition.start();
+  };
+
+  const stopRecording = async () => {
+    if (recognitionRef.current) {
+      // Prevent onend from triggering another stop
+      const rec = recognitionRef.current;
+      recognitionRef.current = null; // Detach ref immediately
+      rec.stop();
+    }
+
+    setIsRecording(false);
+    
+    const rawText = accumulatedTranscriptRef.current.trim();
+    if (rawText.length > 2) {
+      setIsProcessingAudio(true);
+      try {
+        const refined = await refineTranscription(rawText);
+        setRecallText(prev => (prev + ' ' + refined).trim());
+      } catch (e) {
+        console.error("Refinement failed", e);
+        setRecallText(prev => (prev + ' ' + rawText).trim());
+      } finally {
+        setIsProcessingAudio(false);
+        setLiveTranscript('');
+        accumulatedTranscriptRef.current = '';
+      }
+    }
+  };
+
+
+  const handleSubmitRecall = async () => {
     if (!testData) return;
     setAppState(AppState.SCORING);
+    setIsAnalyzing(true);
     
-    const previous = getLatestSession();
+    try {
+      const previous = getLatestSession();
 
-    const sessionResult = scoreSession(
-      testData,
-      recallText,
-      elapsedTime,
-      previous
-    );
+      // 1. Calculate numerical scores (Client-side)
+      const baseResult = scoreSession(
+        testData,
+        recallText,
+        elapsedTime,
+        previous
+      );
 
-    setResult(sessionResult);
-    saveSession(sessionResult);
-    setAppState(AppState.RESULTS);
+      // 2. Get Clinical Analysis from Gemini 3 Pro (Server-side/API)
+      const aiFeedback = await generateClinicalAnalysis(
+        testData.passage,
+        recallText,
+        testData.keypoints.map(k => k.text)
+      );
+
+      const finalResult: SessionResult = {
+        ...baseResult,
+        ai_feedback: aiFeedback
+      };
+
+      setResult(finalResult);
+      saveSession(finalResult);
+      setAppState(AppState.RESULTS);
+    } catch (e) {
+      console.error("Analysis failed", e);
+      // Fallback if AI fails
+      setAppState(AppState.RESULTS); 
+    } finally {
+      setIsAnalyzing(false);
+    }
   };
 
   const handleReset = () => {
@@ -335,13 +436,12 @@ const App: React.FC = () => {
         <div className="absolute top-0 left-0 w-full h-full border-4 border-slate-200 dark:border-slate-700 rounded-full"></div>
         <div className="absolute top-0 left-0 w-full h-full border-4 border-brand-500 rounded-full border-t-transparent animate-spin"></div>
       </div>
-      <h3 className="mt-8 text-xl font-medium text-slate-800 dark:text-slate-100">Sintetizando Conhecimento...</h3>
-      <p className="text-slate-500 dark:text-slate-400 mt-2">Selecionando tema científico e estruturando texto.</p>
-      {generatedConfig && (
-        <p className="text-brand-600 dark:text-brand-400 mt-4 font-medium animate-fade-in text-sm bg-brand-50 dark:bg-brand-900/30 px-3 py-1 rounded-full">
-           Tema selecionado: {generatedConfig.topic}
-        </p>
-      )}
+      <h3 className="mt-8 text-xl font-medium text-slate-800 dark:text-slate-100">
+        {isAnalyzing ? "Gemini 3 Pro Analisando..." : "Sintetizando Conhecimento..."}
+      </h3>
+      <p className="text-slate-500 dark:text-slate-400 mt-2">
+        {isAnalyzing ? "Avaliando nuances clínicas e estruturais do seu relato." : "Selecionando tema científico e estruturando texto."}
+      </p>
     </div>
   );
 
@@ -393,11 +493,11 @@ const App: React.FC = () => {
   };
 
   const renderRecall = () => (
-    <div className="max-w-3xl mx-auto animate-fade-in">
+    <div className="max-w-3xl mx-auto animate-fade-in relative z-0">
       <div className="bg-white dark:bg-slate-900 p-8 rounded-2xl shadow-sm border border-slate-100 dark:border-slate-800 text-center mb-6 transition-colors duration-200">
         <h2 className="text-2xl font-bold text-slate-800 dark:text-slate-100 mb-2">Hora de Relembrar</h2>
         <p className="text-slate-600 dark:text-slate-300">
-          Escreva tudo o que você lembra do texto lido sobre <strong>{testData?.topic}</strong>. 
+          Escreva ou <strong>dite</strong> tudo o que você lembra do texto lido sobre <strong>{testData?.topic}</strong>.
         </p>
       </div>
 
@@ -405,17 +505,81 @@ const App: React.FC = () => {
         <textarea
           value={recallText}
           onChange={(e) => setRecallText(e.target.value)}
-          placeholder="Comece a digitar aqui..."
-          className="w-full h-80 p-6 rounded-xl border border-slate-300 dark:border-slate-600 focus:ring-2 focus:ring-brand-500 focus:border-brand-500 outline-none text-lg resize-none shadow-inner bg-white dark:bg-slate-900 text-slate-900 dark:text-white transition-colors duration-200"
-          autoFocus
+          placeholder="Comece a digitar aqui ou use o microfone..."
+          className="w-full h-80 p-6 rounded-xl border border-slate-300 dark:border-slate-600 focus:ring-2 focus:ring-brand-500 focus:border-brand-500 outline-none text-lg resize-none shadow-inner bg-white dark:bg-slate-900 text-slate-900 dark:text-white transition-colors duration-200 pb-16"
+          disabled={isRecording} 
         />
+        
+        {/* Full Screen Recording Overlay */}
+        {(isRecording || isProcessingAudio) && (
+           <div className="absolute inset-0 bg-slate-900/95 backdrop-blur-md flex flex-col items-center justify-center rounded-xl z-20 animate-fade-in p-8 text-center">
+              
+              {isProcessingAudio ? (
+                // Processing State
+                <>
+                  <div className="relative w-24 h-24 mb-6">
+                    <div className="absolute inset-0 border-4 border-slate-700 rounded-full"></div>
+                    <div className="absolute inset-0 border-4 border-brand-500 rounded-full border-t-transparent animate-spin"></div>
+                  </div>
+                  <h3 className="text-xl font-bold text-white mb-2">Organizando suas ideias...</h3>
+                  <p className="text-slate-400 max-w-sm">O Gemini está removendo hesitações e formatando o texto para máxima clareza.</p>
+                </>
+              ) : (
+                // Active Recording State
+                <>
+                  <div className="flex items-center gap-1.5 h-16 mb-8">
+                     {/* Visual Equalizer Simulation */}
+                     {[...Array(5)].map((_, i) => (
+                       <div key={i} className="w-3 bg-brand-500 rounded-full animate-pulse" 
+                            style={{ 
+                              height: '100%', 
+                              animationDuration: `${0.6 + i * 0.1}s`,
+                              opacity: 0.8
+                            }}>
+                       </div>
+                     ))}
+                  </div>
+
+                  <div className="w-full max-w-lg mb-8 min-h-[80px] text-lg text-slate-300 font-medium leading-relaxed">
+                    "{liveTranscript || "Fale agora, estou ouvindo..."}"
+                  </div>
+
+                  <button
+                    onClick={stopRecording}
+                    className="group relative flex items-center justify-center w-20 h-20 bg-red-500 rounded-full shadow-xl shadow-red-500/30 hover:bg-red-600 transition-all hover:scale-105"
+                  >
+                     <div className="w-8 h-8 bg-white rounded-md"></div>
+                     {/* Pulse Ring */}
+                     <span className="absolute -inset-4 rounded-full border-2 border-red-500/50 animate-ping opacity-75"></span>
+                  </button>
+                  <p className="mt-4 text-sm text-slate-400 uppercase tracking-widest font-semibold">Toque para Finalizar</p>
+                </>
+              )}
+           </div>
+        )}
+
+        {/* Regular Start Button (Visible when NOT recording) */}
+        {!isRecording && !isProcessingAudio && (
+          <div className="absolute bottom-4 left-4 flex gap-2 items-center">
+             <button
+               onClick={startRecording}
+               className="flex items-center gap-2 px-5 py-2.5 rounded-full font-medium transition-all bg-brand-50 dark:bg-slate-800 text-brand-700 dark:text-brand-300 hover:bg-brand-100 dark:hover:bg-slate-700 border border-brand-200 dark:border-slate-700 shadow-sm"
+             >
+               <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
+               </svg>
+               Ditar Resposta
+             </button>
+          </div>
+        )}
+
         <div className="absolute bottom-4 right-4 text-slate-400 text-sm">
            {recallText.length} caracteres
         </div>
       </div>
 
       <div className="mt-6 flex justify-end">
-        <Button onClick={handleSubmitRecall} disabled={recallText.length < 10}>
+        <Button onClick={handleSubmitRecall} disabled={recallText.length < 10 || isProcessingAudio || isRecording}>
           Enviar Resposta
         </Button>
       </div>
@@ -462,6 +626,21 @@ const App: React.FC = () => {
              </div>
           </div>
 
+          {/* Gemini 3 Pro Feedback Section */}
+          {result.ai_feedback && (
+             <div className="p-8 bg-brand-50 dark:bg-brand-900/10 border-b border-brand-100 dark:border-brand-900/30">
+               <div className="flex items-center gap-2 mb-3">
+                 <svg className="w-5 h-5 text-brand-600 dark:text-brand-400" fill="currentColor" viewBox="0 0 20 20">
+                   <path d="M10 2a6 6 0 00-6 6v3.586l-.707.707A1 1 0 004 14h12a1 1 0 00.707-1.707L16 11.586V8a6 6 0 00-6-6zM10 18a3 3 0 01-3-3h6a3 3 0 01-3 3z" />
+                 </svg>
+                 <h3 className="text-lg font-bold text-brand-900 dark:text-brand-100">Análise Clínica (Gemini 3 Pro)</h3>
+               </div>
+               <p className="text-brand-800 dark:text-brand-200 leading-relaxed italic">
+                 "{result.ai_feedback}"
+               </p>
+             </div>
+          )}
+
           <div className="p-8">
             <div className="mb-6 flex items-center justify-between">
                 <h3 className="text-lg font-bold text-slate-800 dark:text-slate-100">Detalhamento dos Pontos-Chave</h3>
@@ -501,7 +680,6 @@ const App: React.FC = () => {
                 const csvContent = "data:text/csv;charset=utf-8," 
                   + "Data,Coverage,Z-Score,WPM,Topic\n"
                   + history.map(h => {
-                      // Find topic for history if possible, otherwise generic
                       return `${h.created_at},${h.coverage_pct},${h.z_coverage},${h.wpm_effective},${h.test_id}`
                   }).join("\n");
                 const encodedUri = encodeURI(csvContent);

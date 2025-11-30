@@ -1,5 +1,7 @@
 {
   "name": "CogniRead - Reading Retention Assessment",
   "description": "A clinical-grade, AI-powered tool to assess reading retention and recall using normative data and reliable change indices.",
-  "requestFramePermissions": []
+  "requestFramePermissions": [
+    "microphone"
+  ]
 }

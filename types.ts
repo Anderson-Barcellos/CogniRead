@@ -61,6 +61,7 @@ export interface SessionResult {
   created_at: string;
   keypoint_results: KeypointResult[];
   qualitative_label: string;
+  ai_feedback?: string; // New field for Gemini 3 analysis
 }
 
 export enum AppState {
